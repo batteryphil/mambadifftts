@@ -52,7 +52,16 @@ class SelectiveSSM(nn.Module):
 
         # 🚀 C++ Fast Path
         if CPP_AVAILABLE:
-            return mamba_scan.ssm_scan_fwd(x, dt, A, B_params, C_params, self.D)
+            orig_dtype = x.dtype
+            out = mamba_scan.ssm_scan_fwd(
+                x.to(torch.float32),
+                dt.to(torch.float32),
+                A.to(torch.float32),
+                B_params.to(torch.float32),
+                C_params.to(torch.float32),
+                self.D.to(torch.float32)
+            )
+            return out.to(orig_dtype)
 
         # 🐌 PyTorch Fallback (Recurrent implementation for CPU/Generic compatibility)
         y = torch.zeros_like(x)

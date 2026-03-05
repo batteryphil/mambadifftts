@@ -1,0 +1,79 @@
+# Mamba TTS (Jarvis V5) Progress Report & Project Overview
+
+## 1. Project Description
+This project implements a Mamba Diffusion Text-to-Speech (TTS) Acoustic Model for the "Jarvis v5" system. It aims to synthesize speech from text using a diffusion-based acoustic modeling approach powered by Mamba state-space blocks.
+
+### Architecture Overview
+The model, defined in `mamba_tts.py`, translates text characters into predicted Mel-spectrograms:
+1.  **Text Encoder**: Encodes input text character IDs utilizing an Embedding layer, Sinusoidal Positional Encodings, and a sequence of Mamba Blocks (`MambaStack`).
+2.  **Duration Predictor**: A 1-D CNN (FastSpeech-style) that predicts the duration (lengths) of each encoded character.
+3.  **Length Regulator**: Upsamples the text encoder states according to the predicted durations to match the temporal resolution of the mel-spectrogram.
+4.  **Diffusion Denoiser (`MambaDiffDenoiser`)**: Uses a Denoising Diffusion Probabilistic Model (DDPM) to iteratively refine noise into a mel-spectrogram. This denoiser replaces traditional transformers with `MambaBlock` layers for highly efficient sequence modeling.
+5.  **Inference (DDIM)**: Uses the Denoising Diffusion Implicit Models (DDIM) scheduler to quickly sample audio in inference mode (e.g., 50 steps instead of 1000).
+
+## 2. Training Progress & Debugging Report
+We are currently running a CPU-optimized training pipeline (`tts_trainer_cpu.py`). The dataset contains 12,430 training samples and 654 validation samples. The model has 24,492,881 trainable parameters.
+
+### Solved Blockers
+During the CPU training initialization, we encountered and resolved several critical hangs that prevented the model from completing its forward passes:
+
+1.  **C++ Extension Float32 Casting Bug**
+    *   **Problem**: The custom C++ Mamba scan extension (`mamba_scan.ssm_scan_fwd`) expects `float32` contiguous memory buffers. PyTorch attempted to pass `bfloat16` inputs to the extension, crashing the training with `RuntimeError: x must be float32`.
+    *   **Fix**: Modified the Python model wrapper in `mamba_diffusion.py` to explicitly cast inputs (`x`, `dt`, `A`, `B_params`, `C_params`, `D_params`) to `torch.float32` before sending them to the C++ extension, then safely casting the outputs back.
+2.  **PyTorch CPU `bfloat16` Autocast Deadlocks**
+    *   **Problem**: PyTorch CPU lacks optimized `bfloat16` fallback kernels for certain operations like `Conv1d`. When `torch.autocast(device_type="cpu", dtype=torch.bfloat16)` encounters these operations, it gets stuck in an unoptimized code-path loop, consuming 100% of a CPU core without progressing.
+    *   **Fix**: Explicitly disabled `USE_BF16 = False` in the CPU trainer script to skip autocasting and guarantee graph execution completes natively in `float32`.
+3.  **Subnormal/Denormal Float CPU Hardware Traps**
+    *   **Problem**: Even after fixing the casting and autocast deadlocks, the model still froze randomly in the `mamba_scan` C++ extension during the `exp()` and exponential arithmetic over long sequences (1000 frames). When floating-point arithmetic products result in extremely small but non-zero numbers (known as subnormal or denormal floats), modern CPU execution traps into microcode emulation to preserve precision, slowing the machine to a halt.
+    *   **Fix**: Enabled Flush-To-Zero (FTZ) and Denormals-Are-Zero (DAZ) instructions globally by adding `torch.set_flush_denormal(True)` to the top of `tts_trainer_cpu.py`.
+4.  **OpenMP Batch Contentions**
+    *   **Problem**: The `mamba_scan.cpp` code used `at::parallel_for` on the batch dimension, which, combined with the PyTorch dataloader multiprocessing, caused thread contentions/deadlocks.
+    *   **Fix**: Re-wrote the loop in the C++ extension to execute the batch dimension sequentially (`for (int b = 0; b < B; ++b)`) and recompiled.
+
+### Current Status
+Training is now cleanly running natively on the processor (`cpu`):
+*   **Speed**: Training processes around ~0.1 samples/sec with an effective batch size of 1.
+*   **Loss**: At Step 800, total loss has smoothly decreased from ~3.11 to ~0.1189.
+*   The `tts_training_stats.json` stream is actively working and the model successfully generated its first `mamba_tts_step0000800.pth` checkpoint.
+
+## 3. Core Code Highlights
+
+### C++ Scan Extension (`mamba_scan.cpp`) Sequence Generation
+```cpp
+// Inner loop over state dimension N
+#pragma GCC ivdep
+for (int n = 0; n < N; ++n) {
+    const float A_bar = std::exp(dt_val * A_d[n]);
+    const float B_bar = dt_val * Bp_bt[n];
+    h_d[n] = A_bar * h_d[n] + B_bar * x_val;
+    y_val += h_d[n] * Cp_bt[n];
+}
+```
+
+### Python Duration Regulator (`mamba_tts.py`)
+```python
+def forward(self, encoder_out: torch.Tensor, durations: torch.Tensor, max_len: Optional[int] = None):
+    outputs = []
+    for b in range(encoder_out.size(0)):
+        rep = torch.repeat_interleave(encoder_out[b], durations[b].clamp(min=0), dim=0)
+        outputs.append(rep)
+    # ... handles padding outputs directly ...
+```
+
+### Diffusion Denoiser Step (`mamba_tts.py`)
+```python
+def forward(self, mel_noisy: torch.Tensor, conditioning: torch.Tensor, t: torch.Tensor):
+    x = self.mel_proj(mel_noisy.transpose(1, 2))
+    x = self.mel_pe(x)
+    t_emb = self.time_emb(t).unsqueeze(1)
+    
+    for layer in self.layers:
+        # Inject time + conditioning at every Mamba layer (DiT-style)
+        residual = x
+        x = layer["norm"](x + t_emb + conditioning)
+        x = layer["mamba"](x)
+        x = layer["drop"](x) + residual
+        
+    x = self.final_norm(x)
+    return self.out_proj(x).transpose(1, 2)
+```

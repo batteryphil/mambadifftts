@@ -1,0 +1,31 @@
+[New LWP 16961]
+[New LWP 16960]
+[New LWP 16959]
+[New LWP 16958]
+[New LWP 16957]
+[New LWP 16956]
+[New LWP 16955]
+[New LWP 16954]
+[New LWP 16953]
+To enable execution of this file add
+	add-auto-load-safe-path /usr/lib/x86_64-linux-gnu/libthread_db.so.1
+line to your configuration file "/root/.config/gdb/gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/root/.config/gdb/gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+[LWP 16958 exited]
+[LWP 16957 exited]
+[LWP 16956 exited]
+[LWP 16955 exited]
+[LWP 16954 exited]
+[LWP 16953 exited]
+
+Thread 4 (LWP 16959):
+#0  0x0000732284e1de62 in gomp_barrier_wait_end () from /home/phil/.local/lib/python3.14/site-packages/torch/lib/libgomp.so.1
+Backtrace stopped: Cannot access memory at address 0x732164d23e88
+
+Thread 3 (LWP 16960):
+[Inferior 1 (process 16951) detached]

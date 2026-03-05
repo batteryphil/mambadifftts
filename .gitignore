@@ -1,7 +1,17 @@
 *.pt
+*.pth
+*.pkl
+*.log
+*.npy
+*.wav
+*.so
 train_data.json
 val_data.json
 training_stats.json
+tts_training_stats.json
 __pycache__/
 .ipynb_checkpoints/
+build/
+data/
+vocoder/
 calc_epoch.py
