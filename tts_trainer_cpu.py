@@ -46,6 +46,30 @@ from tts_data_builder import LJSpeechDataset, collate_tts, VOCAB_SIZE
 
 
 # ---------------------------------------------------------------------------
+# EMA Utility
+# ---------------------------------------------------------------------------
+class EMA:
+    """Exponential Moving Average of model parameters."""
+    def __init__(self, beta=0.9999):
+        self.beta = beta
+        self.shadow = {}
+
+    def register(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                # Keep shadow on CPU to avoid device mismatch
+                self.shadow[name] = param.data.clone().to('cpu')
+
+    def update(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if name in self.shadow:
+                    # theta_ema = beta * theta_ema + (1 - beta) * theta_current
+                    self.shadow[name].copy_(
+                        self.beta * self.shadow[name] + (1.0 - self.beta) * param.data.to('cpu')
+                    )
+
+# ---------------------------------------------------------------------------
 # Hyperparameters (CPU-tuned)
 # ---------------------------------------------------------------------------
 
@@ -60,8 +84,8 @@ DEFAULT_CONFIG = TTSConfig(
     ddim_steps=50,
 )
 
-LR              = 1e-4       # Mamba is NaN-sensitive; 1e-3 causes exploding grads on init
-LR_MIN          = 1e-5
+LR              = 2e-5       # Dropped for Transfer Learning (Jenny)
+LR_MIN          = 2e-6
 WEIGHT_DECAY    = 0.01
 BATCH_SIZE      = 1            # CPU: small batches, compensate with grad accum
 GRAD_ACCUM      = 1            # effective batch = 4 * 8 = 32
@@ -69,8 +93,8 @@ MAX_EPOCHS      = 200
 CKPT_EVERY      = 200
 LOG_EVERY       = 1
 KEEP_CKPTS      = 3
-TRAIN_PKL       = "train_tts.pkl"
-VAL_PKL         = "val_tts.pkl"
+TRAIN_PKL       = "train_jenny.pkl"
+VAL_PKL         = "val_jenny.pkl"
 CKPT_PREFIX     = "mamba_tts"
 USE_BF16        = False        # Disable bfloat16 autocast on CPU due to known hangs
 USE_COMPILE     = False        # torch.compile (disabled to avoid CPU hang)
@@ -80,12 +104,16 @@ USE_COMPILE     = False        # torch.compile (disabled to avoid CPU hang)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model: MambaTTS, step: int, tag: str = "") -> str:
+def save_checkpoint(model: MambaTTS, step: int, tag: str = "", ema_dict: dict = None) -> str:
     """Save model checkpoint and prune old ones."""
     name = f"{CKPT_PREFIX}_step{step:07d}{tag}.pth"
     # Save in float32 always (unwrap from compile if needed)
-    raw = model._orig_mod if hasattr(model, "_orig_mod") else model
-    torch.save(raw.state_dict(), name)
+    
+    if ema_dict is not None:
+        torch.save(ema_dict, name)
+    else:
+        raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+        torch.save(raw.state_dict(), name)
     ckpts = sorted(glob.glob(f"{CKPT_PREFIX}_step*.pth"))
     for old in ckpts[:-KEEP_CKPTS]:
         try:
@@ -106,7 +134,7 @@ def load_latest_checkpoint(model: MambaTTS, resume_path: Optional[str] = None) -
     if path and os.path.exists(path):
         print(f"  -> Resuming from {path}")
         state = torch.load(path, map_location="cpu")
-        raw.load_state_dict(state, strict=True)
+        raw.load_state_dict(state, strict=False)
         try:
             return int(Path(path).stem.split("step")[1][:7])
         except (IndexError, ValueError):
@@ -119,9 +147,19 @@ def compute_val_loss(
     model: MambaDiffTTS,
     criterion: DiffTTSLoss,
     val_loader: DataLoader,
+    ema: Optional[EMA] = None,
 ) -> float:
-    """Run validation pass and return mean total loss."""
+    """Run validation pass and return mean total loss. Evaluates using EMA weights if provided."""
     raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+    
+    # Temporarily swap to EMA weights for validation if available
+    train_weights = {}
+    if ema is not None:
+        for name, param in raw.named_parameters():
+            if param.requires_grad and name in ema.shadow:
+                train_weights[name] = param.data.clone()
+                param.data.copy_(ema.shadow[name])
+
     raw.eval()
     total, count = 0.0, 0
     with torch.no_grad():
@@ -132,10 +170,17 @@ def compute_val_loss(
             mel_mask  = batch["mel_mask"]
 
             with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=USE_BF16):
-                noise_pred, noise_target, log_dur, _ = model(text_ids, mel, durations)
+                noise_pred, noise_target, log_dur, _ = raw(text_ids, mel, durations)
                 loss, _, _ = criterion(noise_pred, noise_target, log_dur, durations, mel_mask)
             total += loss.item()
             count += 1
+
+    # Restore training weights
+    if ema is not None:
+        for name, param in raw.named_parameters():
+            if param.requires_grad and name in train_weights:
+                param.data.copy_(train_weights[name])
+
     raw.train()
     return total / max(count, 1)
 
@@ -197,11 +242,22 @@ def train(max_steps: Optional[int] = None, resume_path: Optional[str] = None) ->
     raw_model  = model._orig_mod if hasattr(model, "_orig_mod") else model
     print(f"  Params: {raw_model.count_params():,}")
 
+    # --- EMA Initialization ---
+    ema = EMA(beta=0.9999)
+    ema.register(raw_model)
+    print("  EMA: initialized and synced to starting weights.")
+
     # --- Optimizer ---
     optimizer = optim.AdamW(
         raw_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
     )
-    total_steps = MAX_EPOCHS * (len(train_loader) // GRAD_ACCUM)
+    
+    # 🎯 Reset Optimizer Momentum for Transfer Learning
+    # We loaded the weights from LJSpeech, but we DO NOT want its old Adam momentum
+    # dragging us away from the new Jenny acoustic targets.
+    optimizer.state.clear()
+    
+    total_steps = MAX_EPOCHS * (max(1, len(train_loader)) // GRAD_ACCUM)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(total_steps, 1), eta_min=LR_MIN
     )
@@ -263,6 +319,7 @@ def train(max_steps: Optional[int] = None, resume_path: Optional[str] = None) ->
                     continue
                 torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=0.5)
                 optimizer.step()
+                ema.update(raw_model)
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -292,17 +349,16 @@ def train(max_steps: Optional[int] = None, resume_path: Optional[str] = None) ->
 
                 # --- Checkpoint ---
                 if global_step % CKPT_EVERY == 0:
-                    ckpt = save_checkpoint(model, global_step)
+                    ckpt = save_checkpoint(model, global_step, ema_dict=ema.shadow)
                     print(f"  ** Checkpoint: {ckpt}")
 
                     if val_loader:
-                        vl = compute_val_loss(model, criterion, val_loader)
+                        vl = compute_val_loss(model, criterion, val_loader, ema=ema)
                         stats["val_loss"].append({"step": global_step, "loss": vl})
                         print(f"  ** Val loss : {vl:.4f}")
                         if vl < best_val:
                             best_val = vl
-                            raw = model._orig_mod if hasattr(model, "_orig_mod") else model
-                            torch.save(raw.state_dict(), f"{CKPT_PREFIX}_best.pth")
+                            torch.save(ema.shadow, f"{CKPT_PREFIX}_best.pth")
                             print(f"  ** Best val  -> {CKPT_PREFIX}_best.pth")
                             
                     _save_stats(stats)
@@ -327,7 +383,7 @@ def train(max_steps: Optional[int] = None, resume_path: Optional[str] = None) ->
         )
         print(f"=== Epoch {epoch + 1}/{MAX_EPOCHS} | avg_loss={avg:.4f} ===")
 
-    save_checkpoint(model, global_step, tag="_final")
+    save_checkpoint(model, global_step, tag="_final", ema_dict=ema.shadow)
     print("Training complete.")
 
 

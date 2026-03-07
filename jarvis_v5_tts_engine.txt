@@ -1,0 +1,1321 @@
+===========================================================
+JARVIS V5 - MAMBA DIFFUSION TTS PROJECT REPORT
+Generated: Sat Mar  7 09:10:28 AM CST 2026
+===========================================================
+
+1. ACHIEVED SOLUTIONS & CRITICAL FIXES
+-----------------------------------------------------------
+We have overcome several low-level hardware and framework blockers to get Mamba training running reliably on CPU:
+
+*   [FIXED] Denormal Float Hardware Traps:
+    Enabled 'torch.set_flush_denormal(True)' to prevent the CPU from entering slow microcode emulation loops when handling extremely small numbers in the Mamba scan. This was the primary cause of the "random hangs".
+    
+*   [FIXED] C++ Extension Type Safety:
+    Modified 'mamba_diffusion.py' to explicitly cast all inputs to 'float32' before calling 'mamba_scan.ssm_scan_fwd'. This resolved 'RuntimeError: x must be float32' when PyTorch tried to pass bfloat16 tensors.
+
+*   [FIXED] OpenMP/Dataloader Deadlocks:
+    Re-wrote the C++ 'ssm_scan_fwd' inner loops to process batches sequentially while maintaining SIMD parallelism for states. This prevents thread contention when combined with PyTorch's multi-process DataLoaders.
+
+*   [FIXED] CPU-Specific Hangs (Autocast/Compile):
+    Disabled 'USE_BF16' and 'USE_COMPILE' in 'tts_trainer_cpu.py'. While these are speedups on GPU, they currently cause deadlocks in specific ILP (Instruction Level Parallelism) or Conv1d kernels on this CPU architecture.
+
+2. CURRENT TRAINING STATUS (AS OF STEP 2159)
+-----------------------------------------------------------
+*   Current Step    : 2159
+*   Current Loss    : ~0.39 (Significant improvement from initial ~3.1)
+*   Training Speed  : ~0.6 - 0.8 samples/s (Major improvement from 0.1 samples/s)
+*   Checkpointing   : Active every 200 steps (Latest: mamba_tts_step0002000.pth)
+*   Stability       : High (No crashes or hangs observed in recent 1000 steps)
+
+3. ENTIRE SYSTEM CODE
+-----------------------------------------------------------
+
+--- FILE: mamba_tts.py ---
+"""
+mamba_tts.py — Mamba Diffusion TTS Acoustic Model (Jarvisv5)
+
+Architecture:
+  Text → MambaEncoder → DurationPredictor → LengthRegulator
+       → conditioning (B, L_mel, D)
+
+  Training  (DDPM):
+    1. Sample t ~ Uniform(0, T)
+    2. Add noise: mel_noisy = sqrt(ᾱ_t)·mel + sqrt(1-ᾱ_t)·ε
+    3. Predict: ε̂ = MambaDiffDenoiser(mel_noisy, conditioning, t)
+    4. Loss: MSE(ε̂, ε)  +  α·MSE(log_dur_pred, log_dur_gt)
+
+  Inference (DDIM, 50 steps):
+    1. mel ~ N(0, I)
+    2. For t in [T, T-T/50, ..., 0]: mel = DDIM_step(mel, ε̂, t)
+    3. Return mel → HiFi-GAN → wav
+
+Reuses MambaBlock from mamba_diffusion.py as the denoiser backbone.
+"""
+
+import math
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from mamba_diffusion import MambaBlock
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TTSConfig:
+    """Configuration for Mamba Diffusion TTS."""
+
+    vocab_size:        int   = 256       # char vocabulary size
+    d_model:           int   = 512       # hidden dimension
+    n_encoder_layers:  int   = 4         # text encoder Mamba blocks
+    n_denoiser_layers: int   = 6         # diffusion denoiser Mamba blocks
+    n_mel_channels:    int   = 80        # mel filter banks
+    max_text_len:      int   = 512
+    max_mel_len:       int   = 1024
+    dropout:           float = 0.1
+    # Diffusion
+    n_diff_steps:      int   = 1000      # DDPM training steps
+    beta_start:        float = 1e-4
+    beta_end:          float = 0.02
+    ddim_steps:        int   = 50        # DDIM inference steps
+
+
+# ---------------------------------------------------------------------------
+# Sinusoidal Positional Encoding
+# ---------------------------------------------------------------------------
+
+class SinusoidalPE(nn.Module):
+    """Fixed sinusoidal positional encoding."""
+
+    def __init__(self, d_model: int, max_len: int = 4096) -> None:
+        """Init sinusoidal PE."""
+        super().__init__()
+        pe  = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float)
+            * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add PE to x of shape (B, L, D)."""
+        return x + self.pe[:, : x.size(1), :]
+
+
+# ---------------------------------------------------------------------------
+# Timestep Embedding (sinusoidal → MLP → D)
+# ---------------------------------------------------------------------------
+
+class TimestepEmbedding(nn.Module):
+    """Converts integer diffusion timestep to a D-dimensional vector."""
+
+    def __init__(self, d_model: int) -> None:
+        """Init timestep embedding."""
+        super().__init__()
+        self.d_model = d_model
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.SiLU(),
+            nn.Linear(d_model * 2, d_model),
+        )
+
+    def _sinusoidal(self, t: torch.Tensor) -> torch.Tensor:
+        """Sinusoidal embedding of scalar timesteps."""
+        half = self.d_model // 2
+        freq = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(half, dtype=torch.float32, device=t.device)
+            / half
+        )
+        args = t.float().unsqueeze(-1) * freq.unsqueeze(0)
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """t: (B,) integer steps → (B, D) embedding."""
+        return self.mlp(self._sinusoidal(t))
+
+
+# ---------------------------------------------------------------------------
+# Duration Predictor
+# ---------------------------------------------------------------------------
+
+class DurationPredictor(nn.Module):
+    """1-D CNN duration predictor (FastSpeech-style)."""
+
+    def __init__(self, d_model: int, n_channels: int = 256, n_layers: int = 2) -> None:
+        """Init duration predictor."""
+        super().__init__()
+        self.layers: nn.ModuleList = nn.ModuleList()
+        in_ch = d_model
+        for _ in range(n_layers):
+            self.layers.append(nn.Conv1d(in_ch, n_channels, kernel_size=3, padding=1))
+            self.layers.append(nn.ReLU())
+            self.layers.append(nn.LayerNorm(n_channels))
+            in_ch = n_channels
+        self.proj = nn.Linear(n_channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, L, D) → (B, L) log-durations."""
+        h = x.transpose(1, 2)
+        for layer in self.layers:
+            if isinstance(layer, nn.LayerNorm):
+                h = layer(h.transpose(1, 2)).transpose(1, 2)
+            else:
+                h = layer(h)
+        out = self.proj(h.transpose(1, 2)).squeeze(-1)
+        return torch.clamp(out, min=-6.0, max=6.0)
+
+
+# ---------------------------------------------------------------------------
+# Length Regulator
+# ---------------------------------------------------------------------------
+
+class LengthRegulator(nn.Module):
+    """Upsample encoder states by repeating per predicted duration."""
+
+    def __init__(self) -> None:
+        """Init (stateless)."""
+        super().__init__()
+
+    def forward(
+        self,
+        encoder_out: torch.Tensor,
+        durations:   torch.Tensor,
+        max_len:     Optional[int] = None,
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        encoder_out : (B, L_text, D)
+        durations   : (B, L_text) integer frame counts
+        Returns (B, L_mel, D), actual_mel_len
+        """
+        outputs = []
+        for b in range(encoder_out.size(0)):
+            rep = torch.repeat_interleave(
+                encoder_out[b], durations[b].clamp(min=0), dim=0
+            )
+            outputs.append(rep)
+
+        if max_len is None:
+            max_len = max(o.size(0) for o in outputs)
+
+        padded = torch.zeros(
+            encoder_out.size(0), max_len, encoder_out.size(2),
+            device=encoder_out.device, dtype=encoder_out.dtype,
+        )
+        for b, o in enumerate(outputs):
+            l = min(o.size(0), max_len)
+            padded[b, :l] = o[:l]
+
+        return padded, max_len
+
+
+# ---------------------------------------------------------------------------
+# Mamba Stack
+# ---------------------------------------------------------------------------
+
+class MambaStack(nn.Module):
+    """N × MambaBlock with pre-LayerNorm + residual + dropout."""
+
+    def __init__(self, d_model: int, n_layers: int, dropout: float = 0.1) -> None:
+        """Init Mamba stack."""
+        super().__init__()
+        self.layers: nn.ModuleList = nn.ModuleList([
+            nn.ModuleDict({
+                "norm":  nn.LayerNorm(d_model),
+                "mamba": MambaBlock(d_model),
+                "drop":  nn.Dropout(dropout),
+            })
+            for _ in range(n_layers)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, L, D)."""
+        for layer in self.layers:
+            residual = x
+            x = layer["norm"](x)
+            x = layer["mamba"](x)
+            x = layer["drop"](x) + residual
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Mamba Diffusion Denoiser
+# ---------------------------------------------------------------------------
+
+class MambaDiffDenoiser(nn.Module):
+    """
+    Denoiser: (noisy_mel, conditioning, t) → predicted noise ε̂
+
+    At each Mamba layer:
+      h ← LayerNorm(h + t_emb + cond)   # inject both signals
+      h ← h + MambaBlock(h)
+    """
+
+    def __init__(self, d_model: int, n_mel: int, n_layers: int,
+                 dropout: float = 0.1) -> None:
+        """Init Mamba diffusion denoiser."""
+        super().__init__()
+        # Project mel frames (80-dim) into model space
+        self.mel_proj   = nn.Linear(n_mel, d_model)
+        self.time_emb   = TimestepEmbedding(d_model)
+        self.mel_pe     = SinusoidalPE(d_model)
+
+        self.layers: nn.ModuleList = nn.ModuleList([
+            nn.ModuleDict({
+                "norm":  nn.LayerNorm(d_model),
+                "mamba": MambaBlock(d_model),
+                "drop":  nn.Dropout(dropout),
+            })
+            for _ in range(n_layers)
+        ])
+
+        self.final_norm = nn.LayerNorm(d_model)
+        self.out_proj   = nn.Linear(d_model, n_mel)
+
+    def forward(
+        self,
+        mel_noisy:    torch.Tensor,   # (B, n_mel, L_mel)
+        conditioning: torch.Tensor,   # (B, L_mel, D)
+        t:            torch.Tensor,   # (B,) integer timestep
+    ) -> torch.Tensor:
+        """Predict noise ε̂. Returns (B, n_mel, L_mel)."""
+        # (B, n_mel, L_mel) → (B, L_mel, D)
+        x = self.mel_proj(mel_noisy.transpose(1, 2))
+        x = self.mel_pe(x)
+
+        # Timestep embedding: (B, D) → (B, 1, D) for broadcasting
+        t_emb = self.time_emb(t).unsqueeze(1)
+
+        for layer in self.layers:
+            # Inject time + conditioning at every layer (DiT-style)
+            residual = x
+            x = layer["norm"](x + t_emb + conditioning)
+            x = layer["mamba"](x)
+            x = layer["drop"](x) + residual
+
+        x = self.final_norm(x)
+        noise_pred = self.out_proj(x).transpose(1, 2)  # (B, n_mel, L_mel)
+        return noise_pred
+
+
+# ---------------------------------------------------------------------------
+# DDPM / DDIM Scheduler
+# ---------------------------------------------------------------------------
+
+class GaussianDiffusion(nn.Module):
+    """
+    Linear-schedule DDPM forward process + DDIM reverse sampler.
+
+    Training: forward_diffusion(x0, t) → (x_t, noise)
+    Inference: ddim_sample(denoiser, conditioning, shape) → x0
+    """
+
+    def __init__(self, config: TTSConfig) -> None:
+        """Build noise schedule buffers."""
+        super().__init__()
+        T    = config.n_diff_steps
+        beta = torch.linspace(config.beta_start, config.beta_end, T)
+        alpha          = 1.0 - beta
+        alpha_bar      = torch.cumprod(alpha, dim=0)
+        alpha_bar_prev = F.pad(alpha_bar[:-1], (1, 0), value=1.0)
+
+        self.register_buffer("beta",           beta)
+        self.register_buffer("alpha",          alpha)
+        self.register_buffer("alpha_bar",      alpha_bar)
+        self.register_buffer("alpha_bar_prev", alpha_bar_prev)
+        self.register_buffer("sqrt_alpha_bar",
+                             torch.sqrt(alpha_bar))
+        self.register_buffer("sqrt_one_minus_alpha_bar",
+                             torch.sqrt(1.0 - alpha_bar))
+
+        self.T          = T
+        self.ddim_steps = config.ddim_steps
+
+    def forward_diffusion(
+        self,
+        x0: torch.Tensor,
+        t:  torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Add noise to x0 at timestep t.
+
+        x0 : (B, n_mel, L_mel) clean mel
+        t  : (B,) integer in [0, T)
+        Returns: x_t (noised), noise (target)
+        """
+        noise = torch.randn_like(x0)
+        sqrt_ab  = self.sqrt_alpha_bar[t].view(-1, 1, 1)
+        sqrt_oab = self.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1)
+        x_t = sqrt_ab * x0 + sqrt_oab * noise
+        return x_t, noise
+
+    @torch.no_grad()
+    def ddim_sample(
+        self,
+        denoiser:     MambaDiffDenoiser,
+        conditioning: torch.Tensor,       # (B, L_mel, D)
+        shape:        Tuple,              # (B, n_mel, L_mel)
+        device:       torch.device,
+        temperature:  float = 1.0,
+        eta:          float = 0.0,        # 0 = deterministic DDIM
+    ) -> torch.Tensor:
+        """
+        DDIM reverse sampling.
+
+        Returns clean mel estimate (B, n_mel, L_mel).
+        """
+        B = shape[0]
+
+        # Build DDIM timestep sequence (evenly spaced)
+        step = self.T // self.ddim_steps
+        timesteps = list(range(0, self.T, step))[::-1]   # T-1 … 0
+
+        x = torch.randn(shape, device=device) * temperature
+
+        for i, t_val in enumerate(timesteps):
+            t_batch = torch.full((B,), t_val, device=device, dtype=torch.long)
+
+            eps = denoiser(x, conditioning, t_batch)   # predicted noise
+
+            ab_t  = self.alpha_bar[t_val]
+            ab_s  = self.alpha_bar[timesteps[i + 1]] if i + 1 < len(timesteps) else torch.tensor(1.0, device=device)
+
+            # Predicted x0
+            x0_pred = (x - (1 - ab_t).sqrt() * eps) / ab_t.sqrt()
+            x0_pred = torch.clamp(x0_pred, -15.0, 4.0)
+
+            # DDIM update
+            sigma    = eta * ((1 - ab_s) / (1 - ab_t) * (1 - ab_t / ab_s)).sqrt()
+            dir_xt   = (1 - ab_s - sigma ** 2).clamp(min=0).sqrt() * eps
+            noise    = sigma * torch.randn_like(x) if eta > 0 else 0
+            x        = ab_s.sqrt() * x0_pred + dir_xt + noise
+
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Full Model
+# ---------------------------------------------------------------------------
+
+class MambaDiffTTS(nn.Module):
+    """
+    Mamba Diffusion TTS acoustic model.
+
+    Training forward: returns (noise_pred, log_dur_pred) for loss computation.
+    Inference: call .synthesize(text_ids) → mel (B, n_mel, L_mel)
+    """
+
+    def __init__(self, config: TTSConfig = TTSConfig()) -> None:
+        """Init MambaDiffTTS."""
+        super().__init__()
+        self.config = config
+        D = config.d_model
+
+        # --- Text Encoder ---
+        self.text_embed = nn.Embedding(config.vocab_size, D, padding_idx=0)
+        self.text_pe    = SinusoidalPE(D, max_len=config.max_text_len)
+        self.encoder    = MambaStack(D, config.n_encoder_layers, config.dropout)
+
+        # --- Duration ---
+        self.dur_pred   = DurationPredictor(D)
+        self.len_reg    = LengthRegulator()
+
+        # --- Diffusion components ---
+        self.diffusion  = GaussianDiffusion(config)
+        self.denoiser   = MambaDiffDenoiser(
+            d_model  = D,
+            n_mel    = config.n_mel_channels,
+            n_layers = config.n_denoiser_layers,
+            dropout  = config.dropout,
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Xavier / zero-bias init."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, std=0.02)
+
+    def _encode(
+        self,
+        text_ids:     torch.Tensor,         # (B, L_text)
+        mel_target:   Optional[torch.Tensor] = None,  # (B, n_mel, L_mel)
+        durations_gt: Optional[torch.Tensor] = None,  # (B, L_text) int
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[int]]:
+        """
+        Encode text and produce conditioning via length regulator.
+
+        Returns: (conditioning (B, L_mel, D), log_dur_pred (B, L_text), mel_len)
+        """
+        x       = self.text_embed(text_ids)
+        x       = self.text_pe(x)
+        enc_out = self.encoder(x)                      # (B, L_text, D)
+
+        log_dur_pred = self.dur_pred(enc_out)          # (B, L_text)
+
+        if durations_gt is not None:
+            durs    = durations_gt
+            max_len = mel_target.size(2) if mel_target is not None else None
+        else:
+            durs    = torch.clamp(
+                torch.round(torch.exp(log_dur_pred) - 1).long(), min=1
+            )
+            max_len = None
+
+        conditioning, mel_len = self.len_reg(enc_out, durs, max_len=max_len)
+        return conditioning, log_dur_pred, mel_len
+
+    def forward(
+        self,
+        text_ids:     torch.Tensor,
+        mel_target:   torch.Tensor,          # (B, n_mel, L_mel)
+        durations_gt: torch.Tensor,          # (B, L_text)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Training forward pass.
+
+        Returns:
+            noise_pred   : (B, n_mel, L_mel)  predicted noise ε̂
+            noise_target : (B, n_mel, L_mel)  actual sampled noise ε
+            log_dur_pred : (B, L_text)
+            mel_noisy    : (B, n_mel, L_mel)  for diagnostics
+        """
+        B = text_ids.size(0)
+        conditioning, log_dur_pred, _ = self._encode(
+            text_ids, mel_target, durations_gt
+        )
+
+        # Sample random timestep per batch item
+        t = torch.randint(0, self.config.n_diff_steps, (B,), device=text_ids.device)
+
+        # Forward diffusion: add noise
+        mel_noisy, noise = self.diffusion.forward_diffusion(mel_target, t)
+
+        # Predict noise
+        noise_pred = self.denoiser(mel_noisy, conditioning, t)
+
+        return noise_pred, noise, log_dur_pred, mel_noisy
+
+    @torch.no_grad()
+    def synthesize(
+        self,
+        text_ids:    torch.Tensor,          # (1, L_text)
+        temperature: float = 1.0,
+        eta:         float = 0.0,           # 0 = deterministic DDIM
+    ) -> torch.Tensor:
+        """
+        Inference: text → mel via DDIM sampling.
+
+        Returns (1, n_mel, L_mel) predicted mel spectrogram.
+        """
+        device = text_ids.device
+        self.eval()
+
+        conditioning, _, mel_len = self._encode(text_ids)
+        shape = (text_ids.size(0), self.config.n_mel_channels, mel_len)
+
+        mel = self.diffusion.ddim_sample(
+            self.denoiser, conditioning, shape, device, temperature, eta
+        )
+        return mel
+
+    def count_params(self) -> int:
+        """Return trainable parameter count."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
+
+class DiffTTSLoss(nn.Module):
+    """
+    DDPM noise-prediction MSE loss + duration MSE loss.
+    """
+
+    def __init__(self, dur_weight: float = 0.1) -> None:
+        """Init loss. dur_weight controls duration loss contribution."""
+        super().__init__()
+        self.dur_weight = dur_weight
+
+    def forward(
+        self,
+        noise_pred:   torch.Tensor,    # (B, n_mel, L_mel)
+        noise_target: torch.Tensor,    # (B, n_mel, L_mel)
+        log_dur_pred: torch.Tensor,    # (B, L_text)
+        durations_gt: torch.Tensor,    # (B, L_text) int
+        mel_mask:     Optional[torch.Tensor] = None,   # (B, L_mel) bool
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (total_loss, noise_loss, dur_loss)."""
+        # Noise prediction MSE (main diffusion objective)
+        noise_loss = F.mse_loss(noise_pred, noise_target, reduction="none")
+        # Guard corrupt targets
+        finite_mask = torch.isfinite(noise_target)
+        noise_loss  = noise_loss * finite_mask.float()
+        if mel_mask is not None:
+            mask       = mel_mask.unsqueeze(1).float()   # (B, 1, L_mel)
+            noise_loss = (noise_loss * mask).sum() / (mask.sum() * noise_pred.size(1) + 1e-8)
+        else:
+            noise_loss = noise_loss.mean()
+
+        # Duration MSE in log space
+        log_dur_gt = torch.log(durations_gt.float().clamp(min=1))
+        dur_loss   = F.mse_loss(log_dur_pred, log_dur_gt)
+
+        total = noise_loss + self.dur_weight * dur_loss
+        return total, noise_loss, dur_loss
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat aliases (so existing test scripts don't break)
+# ---------------------------------------------------------------------------
+MambaTTS = MambaDiffTTS
+TTSLoss  = DiffTTSLoss
+
+
+# ---------------------------------------------------------------------------
+# Quick sanity check
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    cfg = TTSConfig(
+        d_model=256, n_encoder_layers=2, n_denoiser_layers=3,
+        n_diff_steps=100, ddim_steps=10
+    )
+    model = MambaDiffTTS(cfg)
+    print(f"MambaDiffTTS params: {model.count_params():,}")
+
+    B, L_text, L_mel = 2, 20, 64
+    text_ids    = torch.randint(1, 80, (B, L_text))
+    durations   = torch.ones(B, L_text, dtype=torch.long) * (L_mel // L_text)
+    mel_target  = torch.randn(B, 80, L_mel)
+
+    noise_pred, noise, log_dur, mel_noisy = model(text_ids, mel_target, durations)
+    print(f"noise_pred : {noise_pred.shape}")
+    print(f"log_dur    : {log_dur.shape}")
+
+    criterion = DiffTTSLoss()
+    loss, nl, dl = criterion(noise_pred, noise, log_dur, durations)
+    print(f"total={loss.item():.4f}  noise={nl.item():.4f}  dur={dl.item():.4f}")
+
+    # DDIM inference
+    mel_out = model.synthesize(text_ids[:1])
+    print(f"synthesized mel: {mel_out.shape}")
+    print("Sanity check passed ✓")
+
+--- FILE: mamba_diffusion.py ---
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from tqdm import tqdm
+
+# Attempt to load the C++ extension
+try:
+    import mamba_scan
+    CPP_AVAILABLE = True
+except ImportError:
+    CPP_AVAILABLE = False
+    print("Warning: Mamba C++ extension not found. Falling back to (slower) Pure PyTorch implementation.")
+    print("To compile for maximum speed, run: python setup.py install --user")
+
+# --- Mamba Core (Fast C++ / Generic PyTorch Implementation) ---
+
+class SelectiveSSM(nn.Module):
+    def __init__(self, d_model, d_state=16, dt_rank=None):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.dt_rank = dt_rank if dt_rank is not None else math.ceil(d_model / 16)
+
+        # A is a learnable diagonal matrix (initialized as log-space for stability)
+        A = repeat_A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(d_model, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(d_model))
+
+        # Selective projections
+        self.x_proj = nn.ParameterList([
+            nn.Linear(d_model, self.dt_rank + 2 * d_state, bias=False) for _ in range(2) # Bi-directional
+        ])
+        self.dt_proj = nn.ParameterList([
+            nn.Linear(self.dt_rank, d_model, bias=True) for _ in range(2)
+        ])
+
+    def forward(self, x, direction=0):
+        """
+        x: (B, L, D)
+        direction: 0 for forward, 1 for backward
+        """
+        B, L, D = x.shape
+        device = x.device
+
+        # Selective step: Generate dt, B, C from input x
+        x_proj_out = self.x_proj[direction](x)  # (B, L, rank + 2*state)
+        dt_params, B_params, C_params = torch.split(x_proj_out, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+
+        dt = F.softplus(self.dt_proj[direction](dt_params))  # (B, L, D)
+        A = -torch.exp(self.A_log)  # (D, n)
+
+        # 🚀 C++ Fast Path
+        if CPP_AVAILABLE:
+            orig_dtype = x.dtype
+            out = mamba_scan.ssm_scan_fwd(
+                x.to(torch.float32),
+                dt.to(torch.float32),
+                A.to(torch.float32),
+                B_params.to(torch.float32),
+                C_params.to(torch.float32),
+                self.D.to(torch.float32)
+            )
+            return out.to(orig_dtype)
+
+        # 🐌 PyTorch Fallback (Recurrent implementation for CPU/Generic compatibility)
+        y = torch.zeros_like(x)
+        h = torch.zeros(B, D, self.d_state, device=device)  # State (B, D, N)
+        A_expanded = A.unsqueeze(0)  # (1, D, N)
+
+        for t in range(L):
+            dt_t = dt[:, t, :].unsqueeze(-1)  # (B, D, 1)
+            B_t = B_params[:, t, :].unsqueeze(1)  # (B, 1, N)
+            C_t = C_params[:, t, :].unsqueeze(-1)  # (B, N, 1)
+            x_t = x[:, t, :].unsqueeze(-1)  # (B, D, 1)
+
+            A_bar = torch.exp(dt_t * A_expanded)
+            B_bar = dt_t * B_t
+            h = A_bar * h + B_bar * x_t
+            y[:, t, :] = (h @ C_t).squeeze(-1)
+
+        return y + x * self.D
+
+class MambaBlock(nn.Module):
+    def __init__(self, d_model, d_state=16, expand=2):
+        super().__init__()
+        self.d_model = d_model
+        self.d_inner = d_model * expand
+        
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
+        self.conv1d = nn.Conv1d(self.d_inner, self.d_inner, kernel_size=4, padding=3, groups=self.d_inner)
+        self.ssm_fwd = SelectiveSSM(self.d_inner, d_state)
+        self.ssm_bwd = SelectiveSSM(self.d_inner, d_state)
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
+    def forward(self, x):
+        B, L, D = x.shape
+        
+        # In projection
+        xz = self.in_proj(x)
+        x, z = xz.chunk(2, dim=-1) # (B, L, D_inner)
+        
+        # Conv
+        x = x.transpose(1, 2)
+        x = self.conv1d(x)[:, :, :L]
+        x = x.transpose(1, 2)
+        x = F.silu(x)
+        
+        # Bi-directional SSM (Crucial for images/2D signals)
+        y_fwd = self.ssm_fwd(x, direction=0)
+        y_bwd = self.ssm_bwd(x.flip(1), direction=1).flip(1)
+        
+        y = (y_fwd + y_bwd) * F.silu(z)
+        
+        return self.out_proj(y)
+
+# --- Integrated Diffusion Mamba Architecture ---
+
+class TimestepEmbedding(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.d_model = d_model
+
+    def forward(self, t):
+        device = t.device
+        half_dim = self.d_model // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = t[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+class MambaDiffusion(nn.Module):
+    def __init__(self, img_size=32, in_channels=3, patch_size=4, d_model=256, n_layers=4):
+        super().__init__()
+        self.patch_size = patch_size
+        self.n_patches = (img_size // patch_size) ** 2
+        self.d_model = d_model
+        
+        # Encoder: Images to Patches
+        self.patch_embed = nn.Conv2d(in_channels, d_model, kernel_size=patch_size, stride=patch_size)
+        
+        # Timestep conditioning
+        self.time_mlp = nn.Sequential(
+            TimestepEmbedding(d_model),
+            nn.Linear(d_model, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model)
+        )
+        
+        # Mamba Backbone (The "Mixer")
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                "mamba": MambaBlock(d_model),
+                "norm": nn.LayerNorm(d_model)
+            })
+            for _ in range(n_layers)
+        ])
+        
+        # Final Norm + Decoder
+        self.final_norm = nn.LayerNorm(d_model)
+        self.final_linear = nn.Linear(d_model, patch_size * patch_size * in_channels)
+
+    def forward(self, x, t):
+        """
+        x: (B, C, H, W) - Noised image
+        t: (B,) - Diffusion steps
+        """
+        B, C, H, W = x.shape
+        
+        # 1. Patchify
+        x = self.patch_embed(x) # (B, D, H/p, W/p)
+        L = (H // self.patch_size) * (W // self.patch_size)
+        x = x.flatten(2).transpose(1, 2) # (B, L, D)
+        
+        # 2. Time Embedding Injection
+        t_emb = self.time_mlp(t).unsqueeze(1) # (B, 1, D)
+        
+        # 3. Mamba Processing
+        for layer in self.layers:
+            # Condition on time: simple addition or AdaLN (Adaptive Layer Norm)
+            # Here we use addition for simplicity in the "unified" version
+            h = layer["norm"](x + t_emb)
+            x = x + layer["mamba"](h)
+            
+        x = self.final_norm(x)
+        
+        # 4. Depatchify
+        x = self.final_linear(x) # (B, L, p*p*C)
+        x = x.transpose(1, 2).reshape(B, C * self.patch_size**2, H // self.patch_size, W // self.patch_size)
+        x = F.pixel_shuffle(x, self.patch_size) if C == 1 else self.custom_depatchify(x, B, C, H, W)
+        
+        return x
+
+    def custom_depatchify(self, x, B, C, H, W):
+        # x is (B, C*p*p, H/p, W/p)
+        x = x.reshape(B, C, self.patch_size, self.patch_size, H // self.patch_size, W // self.patch_size)
+        x = x.permute(0, 1, 4, 2, 5, 3).reshape(B, C, H, W)
+        return x
+
+# --- Diffusion Engine (Forward/Reverse Logic) ---
+
+class DiffusionEngine:
+    def __init__(self, model, n_steps=1000, device="cpu"):
+        self.model = model.to(device)
+        self.n_steps = n_steps
+        self.device = device
+        
+        # Scheduler (Linear)
+        self.beta = torch.linspace(1e-4, 0.02, n_steps, device=device)
+        self.alpha = 1 - self.beta
+        self.alpha_bar = torch.cumprod(self.alpha, dim=0)
+
+    def noise(self, x_0, t):
+        noise = torch.randn_like(x_0)
+        sqrt_alpha_bar = torch.sqrt(self.alpha_bar[t])[:, None, None, None]
+        sqrt_one_minus_alpha_bar = torch.sqrt(1 - self.alpha_bar[t])[:, None, None, None]
+        return sqrt_alpha_bar * x_0 + sqrt_one_minus_alpha_bar * noise, noise
+
+    @torch.no_grad()
+    def sample(self, shape):
+        self.model.eval()
+        x = torch.randn(shape, device=self.device)
+        
+        for i in tqdm(reversed(range(self.n_steps)), desc="Sampling", total=self.n_steps):
+            t = torch.tensor([i] * shape[0], device=self.device)
+            predicted_noise = self.model(x, t)
+            
+            alpha_t = self.alpha[i]
+            alpha_bar_t = self.alpha_bar[i]
+            beta_t = self.beta[i]
+            
+            if i > 0:
+                noise = torch.randn_like(x)
+            else:
+                noise = 0
+                
+            x = (1 / torch.sqrt(alpha_t)) * (x - ((1 - alpha_t) / (torch.sqrt(1 - alpha_bar_t))) * predicted_noise) + torch.sqrt(beta_t) * noise
+            
+        return x
+
+# --- Training / Demo ---
+
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Running MambaDiffusion on {device}...")
+    
+    # Model Setup
+    # Small parameters for CPU runnability
+    img_size = 32
+    model = MambaDiffusion(img_size=img_size, in_channels=3, d_model=128, n_layers=4)
+    engine = DiffusionEngine(model, n_steps=200, device=device) # Reduced steps for demo
+    
+    # 1. Forward Pass (Noising)
+    x_real = torch.randn(1, 3, 32, 32, device=device)
+    t = torch.tensor([100], device=device)
+    x_noised, noise = engine.noise(x_real, t)
+    
+    # 2. Prediction
+    pred_noise = model(x_noised, t)
+    loss = F.mse_loss(pred_noise, noise)
+    print(f"Forward Consistency Check: Loss = {loss.item():.6f}")
+    
+    # 3. Sampling Demo
+    print("Starting generation process (Universal CPU/GPU Mamba-Diffusion)...")
+    samples = engine.sample((1, 3, 32, 32))
+    print(f"Sampling complete. Output shape: {samples.shape}")
+    print("Architecture 'MambaDiffusion' is unified and functional.")
+
+if __name__ == "__main__":
+    main()
+
+--- FILE: tts_trainer_cpu.py ---
+"""
+tts_trainer_cpu.py — CPU-Optimized Training Script for Mamba TTS
+
+CPU optimizations applied:
+  1. torch.set_num_threads → use all physical cores
+  2. torch.autocast(cpu, bfloat16) → ~2x throughput on modern CPUs with AVX2
+  3. torch.compile(model, backend='inductor') → kernel fusion + loop tiling
+  4. Compiled mamba_scan C++ extension (OpenMP + SIMD via setup.py)
+  5. GradScaler-free training (bf16 has enough dynamic range for L1+MSE loss)
+  6. Gradient accumulation to simulate larger batches without memory pressure
+  7. Pin-memory=False, persistent_workers=True for CPU DataLoader
+  8. torch.backends.mkldnn enabled (oneDNN/MKL-DNN for matmuls)
+
+Usage:
+    python tts_trainer_cpu.py [--max_steps N] [--resume PATH]
+"""
+
+import argparse
+import json
+import os
+import time
+import glob
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+# CPU backend tweaks — set BEFORE any model work
+os.environ.setdefault("OMP_NUM_THREADS",      str(os.cpu_count() or 4))
+os.environ.setdefault("MKL_NUM_THREADS",      str(os.cpu_count() or 4))
+os.environ.setdefault("KMP_BLOCKTIME",        "1")      # minimize thread sleep
+os.environ.setdefault("KMP_AFFINITY",         "granularity=fine,compact,1,0")
+os.environ.setdefault("TORCH_COMPILE_DEBUG",  "0")
+
+import torch
+torch.set_flush_denormal(True) # Fix infinite CPU hangs caused by denormal float hardware traps in C++ extension loops
+torch.set_num_threads(os.cpu_count() or 4)
+torch.set_num_interop_threads(2)
+torch.backends.mkldnn.enabled = True
+
+from mamba_tts import MambaDiffTTS, TTSConfig, DiffTTSLoss
+from tts_data_builder import LJSpeechDataset, collate_tts, VOCAB_SIZE
+
+
+# ---------------------------------------------------------------------------
+# Hyperparameters (CPU-tuned)
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG = TTSConfig(
+    vocab_size=VOCAB_SIZE,
+    d_model=512,
+    n_encoder_layers=4,
+    n_denoiser_layers=6,
+    n_mel_channels=80,
+    dropout=0.1,
+    n_diff_steps=1000,
+    ddim_steps=50,
+)
+
+LR              = 1e-4       # Mamba is NaN-sensitive; 1e-3 causes exploding grads on init
+LR_MIN          = 1e-5
+WEIGHT_DECAY    = 0.01
+BATCH_SIZE      = 1            # CPU: small batches, compensate with grad accum
+GRAD_ACCUM      = 1            # effective batch = 4 * 8 = 32
+MAX_EPOCHS      = 200
+CKPT_EVERY      = 200
+LOG_EVERY       = 1
+KEEP_CKPTS      = 3
+TRAIN_PKL       = "train_tts.pkl"
+VAL_PKL         = "val_tts.pkl"
+CKPT_PREFIX     = "mamba_tts"
+USE_BF16        = False        # Disable bfloat16 autocast on CPU due to known hangs
+USE_COMPILE     = False        # torch.compile (disabled to avoid CPU hang)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(model: MambaTTS, step: int, tag: str = "") -> str:
+    """Save model checkpoint and prune old ones."""
+    name = f"{CKPT_PREFIX}_step{step:07d}{tag}.pth"
+    # Save in float32 always (unwrap from compile if needed)
+    raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+    torch.save(raw.state_dict(), name)
+    ckpts = sorted(glob.glob(f"{CKPT_PREFIX}_step*.pth"))
+    for old in ckpts[:-KEEP_CKPTS]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return name
+
+
+def load_latest_checkpoint(model: MambaTTS, resume_path: Optional[str] = None) -> int:
+    """Load weights from checkpoint. Returns step number."""
+    raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+    path = resume_path
+    if path is None:
+        candidates = sorted(glob.glob(f"{CKPT_PREFIX}_step*.pth"))
+        path = candidates[-1] if candidates else None
+
+    if path and os.path.exists(path):
+        print(f"  -> Resuming from {path}")
+        state = torch.load(path, map_location="cpu")
+        raw.load_state_dict(state, strict=True)
+        try:
+            return int(Path(path).stem.split("step")[1][:7])
+        except (IndexError, ValueError):
+            return 0
+    print("  -> No checkpoint found. Starting fresh.")
+    return 0
+
+
+def compute_val_loss(
+    model: MambaDiffTTS,
+    criterion: DiffTTSLoss,
+    val_loader: DataLoader,
+) -> float:
+    """Run validation pass and return mean total loss."""
+    raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+    raw.eval()
+    total, count = 0.0, 0
+    with torch.no_grad():
+        for batch in val_loader:
+            text_ids  = batch["text_ids"]
+            mel       = batch["mel"]
+            durations = batch["durations"]
+            mel_mask  = batch["mel_mask"]
+
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=USE_BF16):
+                noise_pred, noise_target, log_dur, _ = model(text_ids, mel, durations)
+                loss, _, _ = criterion(noise_pred, noise_target, log_dur, durations, mel_mask)
+            total += loss.item()
+            count += 1
+    raw.train()
+    return total / max(count, 1)
+
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
+def train(max_steps: Optional[int] = None, resume_path: Optional[str] = None) -> None:
+    """Main CPU-optimized training loop."""
+    print(f"[Mamba TTS CPU Trainer]")
+    print(f"  Threads   : {torch.get_num_threads()} (MKL={torch.backends.mkl.is_available()}, "
+          f"oneDNN={torch.backends.mkldnn.enabled})")
+    print(f"  bf16      : {USE_BF16}")
+    print(f"  compile   : {USE_COMPILE}")
+
+    # --- Data ---
+    if not os.path.exists(TRAIN_PKL):
+        raise FileNotFoundError(f"{TRAIN_PKL} not found. Run: python tts_data_builder.py")
+
+    train_ds = LJSpeechDataset(TRAIN_PKL)
+    val_ds   = LJSpeechDataset(VAL_PKL) if os.path.exists(VAL_PKL) else None
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=False,
+        # persistent_workers=True, # Not compatible with num_workers=0
+        collate_fn=collate_tts,
+        drop_last=True,
+    )
+    val_loader = (
+        DataLoader(
+            val_ds,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=0,
+            # persistent_workers=True,
+            collate_fn=collate_tts,
+        )
+        if val_ds else None
+    )
+    print(f"  Data  : {len(train_ds)} train | {len(val_ds) if val_ds else 0} val")
+    print(f"  Batch : {BATCH_SIZE} × {GRAD_ACCUM} accum = {BATCH_SIZE * GRAD_ACCUM} effective")
+
+    # --- Model ---
+    model = MambaDiffTTS(DEFAULT_CONFIG)
+
+    # torch.compile for kernel fusion on CPU — uses 'inductor' backend
+    # which tiles and fuses the MambaBlock matmuls via C++ codegen
+    if USE_COMPILE and hasattr(torch, "compile"):
+        print("  Compiling model with torch.compile(backend='inductor') ...")
+        model = torch.compile(model, backend="inductor", mode="reduce-overhead")
+        print("  Compile graph ready.")
+
+    start_step = load_latest_checkpoint(model, resume_path)
+    raw_model  = model._orig_mod if hasattr(model, "_orig_mod") else model
+    print(f"  Params: {raw_model.count_params():,}")
+
+    # --- Optimizer ---
+    optimizer = optim.AdamW(
+        raw_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
+    )
+    total_steps = MAX_EPOCHS * (len(train_loader) // GRAD_ACCUM)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(total_steps, 1), eta_min=LR_MIN
+    )
+    for _ in range(start_step):
+        scheduler.step()
+
+    criterion = DiffTTSLoss(dur_weight=0.1)
+    stats = {"train_loss": [], "val_loss": [], "step": start_step}
+
+    # --- Train ---
+    model.train()
+    global_step = start_step
+    best_val    = float("inf")
+    t0          = time.time()
+    accum_loss  = 0.0
+
+    optimizer.zero_grad(set_to_none=True)
+
+    for epoch in range(MAX_EPOCHS):
+        for micro_step, batch in enumerate(train_loader):
+            if max_steps and global_step >= max_steps:
+                _save_stats(stats)
+                print(f"max_steps={max_steps} reached.")
+                return
+
+            text_ids  = batch["text_ids"]
+            mel       = batch["mel"]
+            durations = batch["durations"]
+            mel_mask  = batch["mel_mask"]
+
+            # bf16 autocast — ~2× speedup on modern Intel/AMD with AVX2
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=USE_BF16):
+                noise_pred, noise_target, log_dur, _ = model(text_ids, mel, durations)
+                loss, noise_l, dur_l = criterion(
+                    noise_pred, noise_target, log_dur, durations, mel_mask
+                )
+                loss = loss / GRAD_ACCUM
+
+            loss.backward()
+            # Guard: skip bad micro-steps instead of poisoning the accumulator
+            if not torch.isfinite(loss):
+                print(f"  [WARN] micro {micro_step}: NaN/inf loss={loss.item():.4f} — skipping")
+                optimizer.zero_grad(set_to_none=True)
+                accum_loss = 0.0
+                continue
+            accum_loss += loss.item()
+
+            # Optimizer step every GRAD_ACCUM micro-batches
+            if (micro_step + 1) % GRAD_ACCUM == 0:
+                # Skip optimizer step if any gradient is non-finite
+                bad_grads = any(
+                    p.grad is not None and not torch.isfinite(p.grad).all()
+                    for p in raw_model.parameters()
+                )
+                if bad_grads:
+                    print(f"  [WARN] Step {global_step}: non-finite grads — skipping step")
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_loss = 0.0
+                    continue
+                torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=0.5)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+                global_step += 1
+                stats["step"] = global_step
+                norm_loss = accum_loss * GRAD_ACCUM   # un-normalize for logging
+                stats["train_loss"].append(norm_loss)
+                accum_loss = 0.0
+
+                # --- Log ---
+                if global_step % LOG_EVERY == 0:
+                    elapsed = time.time() - t0
+                    lr_now  = scheduler.get_last_lr()[0]
+                    samples_sec = (LOG_EVERY * BATCH_SIZE * GRAD_ACCUM) / max(elapsed, 1e-6)
+                    print(
+                        f"Step {global_step:7d} | "
+                        f"loss={norm_loss:.4f} noise={noise_l.item():.4f} dur={dur_l.item():.4f} | "
+                        f"lr={lr_now:.2e} | "
+                        f"{samples_sec:.1f} samples/s | "
+                        f"{elapsed:.1f}s"
+                    )
+                    t0 = time.time()
+
+                # --- Save Stats for Monitor UI (every LOG_EVERY steps) ---
+                if global_step % LOG_EVERY == 0:
+                    _save_stats(stats)
+
+                # --- Checkpoint ---
+                if global_step % CKPT_EVERY == 0:
+                    ckpt = save_checkpoint(model, global_step)
+                    print(f"  ** Checkpoint: {ckpt}")
+
+                    if val_loader:
+                        vl = compute_val_loss(model, criterion, val_loader)
+                        stats["val_loss"].append({"step": global_step, "loss": vl})
+                        print(f"  ** Val loss : {vl:.4f}")
+                        if vl < best_val:
+                            best_val = vl
+                            raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+                            torch.save(raw.state_dict(), f"{CKPT_PREFIX}_best.pth")
+                            print(f"  ** Best val  -> {CKPT_PREFIX}_best.pth")
+                            
+                    _save_stats(stats)
+
+                # --- Mel preview for monitor (every 500 steps) ---
+                if global_step % 500 == 0:
+                    try:
+                        with torch.no_grad():
+                            # Save noise_pred as proxy for mel preview (80, T)
+                            _mel = noise_pred[0].float().detach().cpu().numpy()
+                        npy_name = f"tts_mel_preview_step{global_step:07d}.npy"
+                        np.save(npy_name, _mel)
+                        # Keep only the 2 most recent previews
+                        for old_npy in sorted(glob.glob("tts_mel_preview_step*.npy"))[:-2]:
+                            os.remove(old_npy)
+                    except Exception:
+                        pass
+
+        avg = (
+            sum(stats["train_loss"][-max(1, len(train_loader) // GRAD_ACCUM):])
+            / max(1, len(train_loader) // GRAD_ACCUM)
+        )
+        print(f"=== Epoch {epoch + 1}/{MAX_EPOCHS} | avg_loss={avg:.4f} ===")
+
+    save_checkpoint(model, global_step, tag="_final")
+    print("Training complete.")
+
+
+def _save_stats(stats: dict) -> None:
+    """Persist training stats to JSON."""
+    with open("tts_training_stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="CPU-optimized Mamba TTS training")
+    parser.add_argument("--max_steps", type=int, default=None,
+                        help="Stop after N optimizer steps (for testing)")
+    parser.add_argument("--resume",    type=str, default=None,
+                        help="Checkpoint path to resume from")
+    args = parser.parse_args()
+    train(max_steps=args.max_steps, resume_path=args.resume)
+
+--- FILE: start_tts_training.sh ---
+#!/usr/bin/env bash
+# start_tts_training.sh — Launch full TTS pipeline (CPU-optimized)
+#
+# Steps:
+#   1. Set LD_LIBRARY_PATH so mamba_scan.so can find libc10.so
+#   2. Build LJSpeech dataset if not already done
+#   3. Download HiFi-GAN vocoder if not already done
+#   4. Launch CPU-optimized training
+#
+# Usage:
+#   chmod +x start_tts_training.sh && ./start_tts_training.sh
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# --- PyTorch shared library path ---
+TORCH_LIB="$(python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"
+export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+
+# --- CPU thread pinning ---
+NCORES="$(nproc)"
+export OMP_NUM_THREADS="$NCORES"
+export MKL_NUM_THREADS="$NCORES"
+export KMP_BLOCKTIME=1
+export KMP_AFFINITY="granularity=fine,compact,1,0"
+
+echo "============================================"
+echo "  Mamba TTS Training — CPU Optimized"
+echo "  Cores    : $NCORES"
+echo "  Torch lib: $TORCH_LIB"
+echo "  Working  : $SCRIPT_DIR"
+echo "============================================"
+
+# --- Verify C++ extension ---
+echo "[1/4] Verifying mamba_scan extension ..."
+python -c "
+import mamba_scan, torch
+import torch
+B, L, D, N = 1, 16, 16, 8
+x  = torch.randn(B, L, D)
+dt = torch.rand(B, L, D) * 0.1
+A  = -torch.rand(D, N)
+Bp = torch.randn(B, L, N)
+Cp = torch.randn(B, L, N)
+Dp = torch.randn(D)
+y = mamba_scan.ssm_scan_fwd(x, dt, A, Bp, Cp, Dp)
+print(f'  SSM scan OK: output shape={y.shape}')
+"
+
+# --- Dataset ---
+if [ ! -f "train_tts.pkl" ]; then
+    echo "[2/4] Building LJSpeech dataset (downloads ~2.6 GB) ..."
+    python tts_data_builder.py
+else
+    echo "[2/4] Dataset found (train_tts.pkl). Skipping download."
+fi
+
+# --- Vocoder ---
+if [ ! -f "vocoder/generator.pth" ]; then
+    echo "[3/4] Downloading HiFi-GAN vocoder ..."
+    python download_vocoder.py
+else
+    echo "[3/4] Vocoder found. Skipping download."
+fi
+
+# --- Train ---
+echo "[4/4] Starting CPU-optimized training ..."
+echo "      Log: tts_training.log"
+echo "      Stop with: Ctrl+C (checkpoints saved every 200 steps)"
+echo ""
+
+PYTHONUNBUFFERED=1 python tts_trainer_cpu.py "$@" 2>&1 | tee tts_training.log
+

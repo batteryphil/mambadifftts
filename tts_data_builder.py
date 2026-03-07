@@ -32,9 +32,14 @@ LJSPEECH_URL = (
     "https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2"
 )
 DATA_DIR = Path("./data/ljspeech")
-ARCHIVE   = Path("./data/ljspeech.tar.bz2")
+ARCHIVE   = Path("data/ljspeech.tar.bz2")
 TRAIN_OUT = Path("train_tts.pkl")
 VAL_OUT   = Path("val_tts.pkl")
+
+JENNY_META_URL = "https://huggingface.co/datasets/reach-vb/jenny_tts_dataset/resolve/main/metadata.csv"
+JENNY_DATA_DIR = Path("./data/jenny_tts")
+JENNY_TRAIN_OUT = Path("train_jenny.pkl")
+JENNY_VAL_OUT   = Path("val_jenny.pkl")
 
 # Audio config
 SAMPLE_RATE = 22050
@@ -226,6 +231,91 @@ def build_dataset() -> None:
     print(f"Vocab size (char-level): {VOCAB_SIZE}")
 
 
+def build_jenny_dataset() -> None:
+    """
+    Read Jenny metadata, compute mel spectrograms, tokenize text,
+    compute durations, and save train/val pickle files specifically for Jenny.
+    """
+    JENNY_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    meta_csv = JENNY_DATA_DIR / "metadata.csv"
+
+    if not meta_csv.exists():
+        print(f"Downloading Jenny metadata from {JENNY_META_URL} ...")
+        urllib.request.urlretrieve(JENNY_META_URL, meta_csv)
+    
+    wav_dir = JENNY_DATA_DIR / "wavs"
+    if not wav_dir.exists():
+        print("[WARN] Jenny wavs directory not found! You must manually download and extract the dataset audio to `data/jenny_tts/wavs/`")
+        print("Dataset available at: https://www.languagereactor.com/dataset.tar.zst")
+        # Proceed anyway so it can fail gracefully locally if no wavs exist
+
+    # Read metadata
+    samples: List[Tuple[str, str]] = []
+    with open(meta_csv, "r", encoding="utf-8") as f:
+        reader = csv.reader(f, delimiter="|")
+        for row in reader:
+            if len(row) < 3:
+                continue
+            fileid, _, normalized = row[0], row[1], row[2]
+            # Ensure fileid has .wav extension if omitted
+            if not fileid.endswith(".wav"):
+                fileid = f"{fileid}.wav"
+            wav_path = str(wav_dir / fileid)
+            if os.path.exists(wav_path):
+                samples.append((wav_path, normalized.strip()))
+
+    samples = samples[:MAX_SAMPLES]
+    print(f"Processing {len(samples)} Jenny samples ...")
+
+    records = []
+    n_skip = 0
+    for wav_path, text in tqdm(samples, desc="Extracting Jenny mels"):
+        text_ids = text_to_ids(text)
+        if len(text_ids) < 2:
+            n_skip += 1
+            continue
+        try:
+            mel = wav_to_mel(wav_path)   # (80, T)
+        except Exception as e:
+            n_skip += 1
+            continue
+
+        n_text = len(text_ids)
+        n_mel  = mel.shape[1]
+        if n_mel < n_text:
+            n_skip += 1
+            continue
+
+        durations = compute_durations(n_text, n_mel)
+        records.append({
+            "text_ids":  np.array(text_ids, dtype=np.int32),
+            "mel":       mel,
+            "durations": durations,
+        })
+
+    print(f"Built {len(records)} records | {n_skip} skipped.")
+    if len(records) == 0:
+        print("ERROR: No valid records built. Check if the audio exists in data/jenny_tts/wavs/")
+        return
+
+    # Split
+    val_cut = max(1, int(len(records) * VAL_FRACTION))
+    import random
+    random.shuffle(records)
+    val_records   = records[:val_cut]
+    train_records = records[val_cut:]
+
+    with open(JENNY_TRAIN_OUT, "wb") as f:
+        pickle.dump(train_records, f)
+    with open(JENNY_VAL_OUT, "wb") as f:
+        pickle.dump(val_records, f)
+
+    print(
+        f"Saved {len(train_records)} train → {JENNY_TRAIN_OUT} | "
+        f"{len(val_records)} val → {JENNY_VAL_OUT}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # PyTorch Dataset
 # ---------------------------------------------------------------------------
@@ -296,4 +386,13 @@ def collate_tts(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    build_dataset()
+    import argparse
+    parser = argparse.ArgumentParser(description="Mamba TTS Dataset Builder")
+    parser.add_argument("--dataset", type=str, choices=["LJSpeech", "Jenny"], default="LJSpeech",
+                        help="Which dataset to build: LJSpeech or Jenny")
+    args = parser.parse_args()
+
+    if args.dataset == "Jenny":
+        build_jenny_dataset()
+    else:
+        build_dataset()
