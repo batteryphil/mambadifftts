@@ -2,7 +2,7 @@ import json
 import torch
 import numpy as np
 from pathlib import Path
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from tts_data_builder import wav_to_mel, compute_durations
 
 # These should match dataset_indexer.py
@@ -34,6 +34,19 @@ class MultiStyleDataset(Dataset):
         self.mel_cache_dir = Path(mel_cache_dir)
         self.augment = augment
         print(f"MultiStyleDataset: Loaded {len(self.records)} records from {index_path}")
+
+    def get_mel_lengths(self):
+        """Returns approximate mel lengths for bucketing."""
+        lengths = []
+        # Constants from tts_data_builder.py
+        SR = 22050
+        HOP = 256
+        for r in self.records:
+            dur = r.get("duration_seconds", 0)
+            # mel_len is dur * SR / HOP
+            mel_len = int(dur * SR / HOP)
+            lengths.append(mel_len)
+        return np.array(lengths)
 
     def __len__(self):
         return len(self.records)
@@ -92,6 +105,36 @@ class MultiStyleDataset(Dataset):
             "emotion_id": torch.tensor(emo_id, dtype=torch.long),
             "style_id": torch.tensor(sty_id, dtype=torch.long)
         }
+
+class BucketBatchSampler(Sampler):
+    """
+    Groups indices by sequence length to minimize padding.
+    """
+    def __init__(self, lengths, batch_size, shuffle=True, drop_last=False):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        
+        # 1. Sort indices by length
+        indices = np.argsort(lengths)
+        
+        # 2. Group into batches
+        self.batches = []
+        for i in range(0, len(indices), batch_size):
+            batch = indices[i : i + batch_size].tolist()
+            if not drop_last or len(batch) == batch_size:
+                self.batches.append(batch)
+
+    def __iter__(self):
+        if self.shuffle:
+            # Shuffle the order of batches, not items within a batch
+            np.random.shuffle(self.batches)
+        for batch in self.batches:
+            yield batch
+
+    def __len__(self):
+        return len(self.batches)
 
 def collate_multi(batch):
     max_text = max(b["text_ids"].size(0) for b in batch)

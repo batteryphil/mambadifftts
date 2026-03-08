@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 
 from mamba_tts import MambaTTS, TTSConfig, DiffTTSLoss, GaussianDiffusion
 import numpy as np
-from multi_style_data import MultiStyleDataset, collate_multi, EMOTIONS, STYLES, VOCAB_SIZE
+from multi_style_data import MultiStyleDataset, collate_multi, BucketBatchSampler, EMOTIONS, STYLES, VOCAB_SIZE
 # from tts_data_builder import VOCAB_SIZE # Switched to phoneme vocab
 
 
@@ -151,29 +151,28 @@ def train(max_steps: Optional[int] = None, resume_path: Optional[str] = None) ->
 
     torch.backends.cudnn.benchmark = True
 
+    train_sampler = BucketBatchSampler(train_ds.get_mel_lengths(), batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     train_loader = DataLoader(
         train_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
+        batch_sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
         collate_fn=collate_multi,
-        drop_last=True,
         persistent_workers=(num_workers > 0),
         prefetch_factor=2 if num_workers > 0 else None,
     )
-    val_loader = (
-        DataLoader(
+    if val_ds:
+        val_sampler = BucketBatchSampler(val_ds.get_mel_lengths(), batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
+        val_loader = DataLoader(
             val_ds,
-            batch_size=BATCH_SIZE,
-            shuffle=False,
+            batch_sampler=val_sampler,
             num_workers=num_workers,
             collate_fn=collate_multi,
             persistent_workers=(num_workers > 0),
             prefetch_factor=2 if num_workers > 0 else None,
         )
-        if val_ds else None
-    )
+    else:
+        val_loader = None
     print(f"  -> {len(train_ds)} train | {len(val_ds) if val_ds else 0} val samples")
 
     # --- Model ---
