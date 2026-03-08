@@ -1,32 +1,27 @@
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CppExtension
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 import os
 
-# CPU-optimized build flags
-# -O3          : maximum optimization
-# -march=native: use all available CPU ISA (AVX2 / AVX-512 if present)
-# -fopenmp     : enable OpenMP parallelism (used by at::parallel_for)
-# -ffast-math  : allow reassociation + reciprocal estimates (safe for SSM)
-# -funroll-loops: unroll the N and D inner loops
-# -std=c++17   : required by LibTorch headers
-
-extra_cxx = [
+# Build flags
+# On Windows, we need to use MSVC-style flags (/O2, /std:c++17) instead of GCC-style (-O3, -std=c++17)
+extra_cxx = ["/O2", "/std:c++17"]
+# nvcc flags: allow unsupported compiler (Visual Studio 2022/2025) and suppress STL version mismatch
+extra_cuda = [
     "-O3",
-    "-std=c++17",
-    "-march=native",
-    "-fopenmp",
-    "-ffast-math",
-    "-funroll-loops",
+    "-allow-unsupported-compiler",
+    "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 ]
 
 setup(
     name="mamba_scan",
     ext_modules=[
-        CppExtension(
+        CUDAExtension(
             name="mamba_scan",
-            sources=["mamba_scan.cpp"],
-            extra_compile_args={"cxx": extra_cxx},
-            extra_link_args=["-fopenmp"],
+            sources=["mamba_scan.cpp", "mamba_scan_cuda.cu"],
+            extra_compile_args={
+                "cxx": extra_cxx,
+                "nvcc": extra_cuda
+            },
         ),
     ],
     cmdclass={"build_ext": BuildExtension},

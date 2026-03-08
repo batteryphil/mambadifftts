@@ -2,15 +2,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import os
 from tqdm import tqdm
 
 # Attempt to load the C++ extension
 try:
+    if hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\bin")
     import mamba_scan
     CPP_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     CPP_AVAILABLE = False
-    print("Warning: Mamba C++ extension not found. Falling back to (slower) Pure PyTorch implementation.")
+    print(f"Warning: Mamba C++ extension not found ({e}). Falling back to (slower) Pure PyTorch implementation.")
     print("To compile for maximum speed, run: python setup.py install --user")
 
 # --- Mamba Core (Fast C++ / Generic PyTorch Implementation) ---
@@ -50,20 +53,28 @@ class SelectiveSSM(nn.Module):
         dt = F.softplus(self.dt_proj[direction](dt_params))  # (B, L, D)
         A = -torch.exp(self.A_log)  # (D, n)
 
-        # 🚀 C++ Fast Path
+        # 🚀 C++ Fast Path (Now supporting both CPU and CUDA!)
         if CPP_AVAILABLE:
-            orig_dtype = x.dtype
-            out = mamba_scan.ssm_scan_fwd(
-                x.to(torch.float32),
-                dt.to(torch.float32),
-                A.to(torch.float32),
-                B_params.to(torch.float32),
-                C_params.to(torch.float32),
-                self.D.to(torch.float32)
+            dtype = x.dtype
+            return mamba_scan.ssm_scan_fwd(
+                x, 
+                dt.to(dtype), 
+                A.to(dtype), 
+                B_params.to(dtype), 
+                C_params.to(dtype), 
+                self.D.to(dtype)
             )
-            return out.to(orig_dtype)
 
         # 🐌 PyTorch Fallback (Recurrent implementation for CPU/Generic compatibility)
+        # Ensure we run fallback in float32 for stability
+        orig_dtype = x.dtype
+        x = x.to(torch.float32)
+        dt = dt.to(torch.float32)
+        A = A.to(torch.float32)
+        B_params = B_params.to(torch.float32)
+        C_params = C_params.to(torch.float32)
+        D_params = self.D.to(torch.float32)
+
         y = torch.zeros_like(x)
         h = torch.zeros(B, D, self.d_state, device=device)  # State (B, D, N)
         A_expanded = A.unsqueeze(0)  # (1, D, N)
@@ -79,7 +90,7 @@ class SelectiveSSM(nn.Module):
             h = A_bar * h + B_bar * x_t
             y[:, t, :] = (h @ C_t).squeeze(-1)
 
-        return y + x * self.D
+        return (y + x * D_params).to(orig_dtype)
 
 class MambaBlock(nn.Module):
     def __init__(self, d_model, d_state=16, expand=2):

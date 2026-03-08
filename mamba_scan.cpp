@@ -18,11 +18,16 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Helper: verify tensor is contiguous float32 on CPU
+// Helper: verify tensor is contiguous (and float32 if on CPU)
 // ---------------------------------------------------------------------------
-inline void check_cpu_float(const torch::Tensor &t, const char *name) {
-  TORCH_CHECK(t.device().is_cpu(), name, " must be on CPU");
-  TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
+inline void check_tensor(const torch::Tensor &t, const char *name) {
+  if (t.device().is_cpu()) {
+    TORCH_CHECK(t.dtype() == torch::kFloat32, name, " on CPU must be float32");
+  } else if (t.device().is_cuda()) {
+    TORCH_CHECK(t.dtype() == torch::kFloat32 || t.dtype() == torch::kHalf ||
+                    t.dtype() == torch::kBFloat16,
+                name, " on CUDA must be float32, half or bfloat16");
+  }
   TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
@@ -41,12 +46,12 @@ torch::Tensor ssm_scan_fwd_cpu(torch::Tensor x, torch::Tensor dt,
                                torch::Tensor A, torch::Tensor B_params,
                                torch::Tensor C_params, torch::Tensor D_params) {
   // --- Validation ---
-  check_cpu_float(x, "x");
-  check_cpu_float(dt, "dt");
-  check_cpu_float(A, "A");
-  check_cpu_float(B_params, "B_params");
-  check_cpu_float(C_params, "C_params");
-  check_cpu_float(D_params, "D_params");
+  check_tensor(x, "x");
+  check_tensor(dt, "dt");
+  check_tensor(A, "A");
+  check_tensor(B_params, "B_params");
+  check_tensor(C_params, "C_params");
+  check_tensor(D_params, "D_params");
 
   const int B = x.size(0);
   const int L = x.size(1);
@@ -115,14 +120,23 @@ torch::Tensor ssm_scan_fwd_cpu(torch::Tensor x, torch::Tensor dt,
 }
 
 // ---------------------------------------------------------------------------
-// ssm_scan_fwd — dispatch wrapper (CPU only for this build)
+// Forward declarations for CUDA (defined in .cu file)
+// ---------------------------------------------------------------------------
+torch::Tensor ssm_scan_fwd_cuda(torch::Tensor x, torch::Tensor dt,
+                                torch::Tensor A, torch::Tensor B_params,
+                                torch::Tensor C_params, torch::Tensor D_params);
+
+// ---------------------------------------------------------------------------
+// ssm_scan_fwd — dispatch wrapper
 // ---------------------------------------------------------------------------
 torch::Tensor ssm_scan_fwd(torch::Tensor x, torch::Tensor dt, torch::Tensor A,
                            torch::Tensor B_params, torch::Tensor C_params,
                            torch::Tensor D_params) {
-  TORCH_CHECK(x.device().is_cpu(),
-              "This extension is CPU-only. "
-              "For CUDA, install the official mamba-ssm package.");
+  if (x.device().is_cuda()) {
+    return ssm_scan_fwd_cuda(x.contiguous(), dt.contiguous(), A.contiguous(),
+                             B_params.contiguous(), C_params.contiguous(),
+                             D_params.contiguous());
+  }
   return ssm_scan_fwd_cpu(x.contiguous(), dt.contiguous(), A.contiguous(),
                           B_params.contiguous(), C_params.contiguous(),
                           D_params.contiguous());

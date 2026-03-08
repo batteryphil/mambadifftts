@@ -21,7 +21,7 @@ Reuses MambaBlock from mamba_diffusion.py as the denoiser backbone.
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Union
 
 import torch
 import torch.nn as nn
@@ -204,13 +204,22 @@ class MambaStack(nn.Module):
             for _ in range(n_layers)
         ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, use_checkpointing: bool = False) -> torch.Tensor:
         """x: (B, L, D)."""
+        def run_layer(layer_norm, layer_mamba, layer_drop, h):
+            residual = h
+            h = layer_norm(h)
+            h = layer_mamba(h)
+            h = layer_drop(h) + residual
+            return h
+
         for layer in self.layers:
-            residual = x
-            x = layer["norm"](x)
-            x = layer["mamba"](x)
-            x = layer["drop"](x) + residual
+            if use_checkpointing and self.training:
+                # Need to use a wrapper if torch.utils.checkpoint is used
+                from torch.utils.checkpoint import checkpoint
+                x = checkpoint(run_layer, layer["norm"], layer["mamba"], layer["drop"], x, use_reentrant=False)
+            else:
+                x = run_layer(layer["norm"], layer["mamba"], layer["drop"], x)
         return x
 
 
@@ -253,6 +262,7 @@ class MambaDiffDenoiser(nn.Module):
         mel_noisy:    torch.Tensor,   # (B, n_mel, L_mel)
         conditioning: torch.Tensor,   # (B, L_mel, D)
         t:            torch.Tensor,   # (B,) integer timestep
+        use_checkpointing: bool = False,
     ) -> torch.Tensor:
         """Predict noise ε̂. Returns (B, n_mel, L_mel)."""
         # (B, n_mel, L_mel) → (B, L_mel, D)
@@ -262,12 +272,20 @@ class MambaDiffDenoiser(nn.Module):
         # Timestep embedding: (B, D) → (B, 1, D) for broadcasting
         t_emb = self.time_emb(t).unsqueeze(1)
 
+        def run_layer(layer_norm, layer_mamba, layer_drop, h, signal):
+            residual = h
+            h = layer_norm(h + signal)
+            h = layer_mamba(h)
+            h = layer_drop(h) + residual
+            return h
+
         for layer in self.layers:
-            # Inject time + conditioning at every layer (DiT-style)
-            residual = x
-            x = layer["norm"](x + t_emb + conditioning)
-            x = layer["mamba"](x)
-            x = layer["drop"](x) + residual
+            signal = t_emb + conditioning
+            if use_checkpointing and self.training:
+                from torch.utils.checkpoint import checkpoint
+                x = checkpoint(run_layer, layer["norm"], layer["mamba"], layer["drop"], x, signal, use_reentrant=False)
+            else:
+                x = run_layer(layer["norm"], layer["mamba"], layer["drop"], x, signal)
 
         x = self.final_norm(x)
         noise_pred = self.out_proj(x).transpose(1, 2)  # (B, n_mel, L_mel)
@@ -332,6 +350,7 @@ class GaussianDiffusion(nn.Module):
         conditioning: torch.Tensor,       # (B, L_mel, D)
         shape:        Tuple,              # (B, n_mel, L_mel)
         device:       torch.device,
+        steps:        Optional[int] = None,
         temperature:  float = 1.0,
         eta:          float = 0.0,        # 0 = deterministic DDIM
     ) -> torch.Tensor:
@@ -341,9 +360,10 @@ class GaussianDiffusion(nn.Module):
         Returns clean mel estimate (B, n_mel, L_mel).
         """
         B = shape[0]
+        ddim_steps = steps if steps is not None else self.ddim_steps
 
         # Build DDIM timestep sequence (evenly spaced)
-        step = self.T // self.ddim_steps
+        step = self.T // ddim_steps
         timesteps = list(range(0, self.T, step))[::-1]   # T-1 … 0
 
         x = torch.randn(shape, device=device) * temperature
@@ -369,6 +389,29 @@ class GaussianDiffusion(nn.Module):
         return x
 
 
+@dataclass
+class TTSConfig:
+    """Configuration for Mamba Diffusion TTS."""
+
+    vocab_size:        int   = 256       # char vocabulary size
+    d_model:           int   = 512       # hidden dimension
+    n_encoder_layers:  int   = 4         # text encoder Mamba blocks
+    n_denoiser_layers: int   = 6         # diffusion denoiser Mamba blocks
+    n_mel_channels:    int   = 80        # mel filter banks
+    max_text_len:      int   = 512
+    max_mel_len:       int   = 1024
+    dropout:           float = 0.1
+    # Emotion/Style
+    n_emotions:        int   = 8         # neutral, soft, whisper, seductive, happy, sad, angry, dramatic
+    n_styles:          int   = 3         # narration, dialogue, expressive
+    
+    # Diffusion
+    n_diff_steps:      int   = 1000      # DDPM training steps
+    beta_start:        float = 1e-4
+    beta_end:          float = 0.02
+    ddim_steps:        int   = 50        # DDIM inference steps
+
+
 # ---------------------------------------------------------------------------
 # Full Model
 # ---------------------------------------------------------------------------
@@ -390,6 +433,11 @@ class MambaDiffTTS(nn.Module):
         # --- Text Encoder ---
         self.text_embed = nn.Embedding(config.vocab_size, D, padding_idx=0)
         self.text_pe    = SinusoidalPE(D, max_len=config.max_text_len)
+        
+        # --- Emotion & Style Embeddings ---
+        self.emotion_embed = nn.Embedding(config.n_emotions, D)
+        self.style_embed   = nn.Embedding(config.n_styles, D)
+        
         self.encoder    = MambaStack(D, config.n_encoder_layers, config.dropout)
 
         # --- Duration ---
@@ -405,7 +453,13 @@ class MambaDiffTTS(nn.Module):
             dropout  = config.dropout,
         )
 
+        self.use_gradient_checkpointing = False
         self._init_weights()
+
+    def gradient_checkpointing_enable(self, **kwargs):
+        """Standard method to enable gradient checkpointing for memory efficiency."""
+        self.use_gradient_checkpointing = True
+        print("Gradient checkpointing enabled for Mamba TTS.")
 
     def _init_weights(self) -> None:
         """Xavier / zero-bias init."""
@@ -420,17 +474,34 @@ class MambaDiffTTS(nn.Module):
     def _encode(
         self,
         text_ids:     torch.Tensor,         # (B, L_text)
+        emotion_ids:  Optional[torch.Tensor] = None, # (B,) or (B, L_text)
+        style_ids:    Optional[torch.Tensor] = None, # (B,) or (B, L_text)
         mel_target:   Optional[torch.Tensor] = None,  # (B, n_mel, L_mel)
         durations_gt: Optional[torch.Tensor] = None,  # (B, L_text) int
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[int]]:
         """
         Encode text and produce conditioning via length regulator.
-
-        Returns: (conditioning (B, L_mel, D), log_dur_pred (B, L_text), mel_len)
+        Supports per-sentence/per-token emotion/style conditioning.
         """
-        x       = self.text_embed(text_ids)
+        x = self.text_embed(text_ids)
+        
+        # Inject Emotion + Style
+        if emotion_ids is not None:
+            e_emb = self.emotion_embed(emotion_ids)
+            if e_emb.dim() == 2: # (B, D) -> broadcast to (B, L, D)
+                x = x + e_emb.unsqueeze(1)
+            else: # (B, L, D)
+                x = x + e_emb
+                
+        if style_ids is not None:
+            s_emb = self.style_embed(style_ids)
+            if s_emb.dim() == 2: # (B, D)
+                x = x + s_emb.unsqueeze(1)
+            else: # (B, L, D)
+                x = x + s_emb
+            
         x       = self.text_pe(x)
-        enc_out = self.encoder(x)                      # (B, L_text, D)
+        enc_out = self.encoder(x, use_checkpointing=self.use_gradient_checkpointing) # (B, L_text, D)
 
         log_dur_pred = self.dur_pred(enc_out)          # (B, L_text)
 
@@ -451,6 +522,8 @@ class MambaDiffTTS(nn.Module):
         text_ids:     torch.Tensor,
         mel_target:   torch.Tensor,          # (B, n_mel, L_mel)
         durations_gt: torch.Tensor,          # (B, L_text)
+        emotion_ids:  Optional[torch.Tensor] = None,
+        style_ids:    Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Training forward pass.
@@ -463,7 +536,7 @@ class MambaDiffTTS(nn.Module):
         """
         B = text_ids.size(0)
         conditioning, log_dur_pred, _ = self._encode(
-            text_ids, mel_target, durations_gt
+            text_ids, emotion_ids, style_ids, mel_target, durations_gt
         )
 
         # Sample random timestep per batch item
@@ -473,7 +546,7 @@ class MambaDiffTTS(nn.Module):
         mel_noisy, noise = self.diffusion.forward_diffusion(mel_target, t)
 
         # Predict noise
-        noise_pred = self.denoiser(mel_noisy, conditioning, t)
+        noise_pred = self.denoiser(mel_noisy, conditioning, t, use_checkpointing=self.use_gradient_checkpointing)
 
         return noise_pred, noise, log_dur_pred, mel_noisy
 
@@ -481,22 +554,40 @@ class MambaDiffTTS(nn.Module):
     def synthesize(
         self,
         text_ids:    torch.Tensor,          # (1, L_text)
-        temperature: float = 1.0,
+        emotion_id:  Union[int, List[int]] = 0,
+        style_id:    Union[int, List[int]] = 0,
+        steps:       Optional[int] = None,  # Number of DDIM steps
+        temperature: float = 1.0,           # noise scale
         eta:         float = 0.0,           # 0 = deterministic DDIM
     ) -> torch.Tensor:
         """
         Inference: text → mel via DDIM sampling.
-
-        Returns (1, n_mel, L_mel) predicted mel spectrogram.
+        Supports dynamic emotion modulation via per-token IDs.
         """
         device = text_ids.device
         self.eval()
 
-        conditioning, _, mel_len = self._encode(text_ids)
+        # Handle per-token or global IDs
+        if isinstance(emotion_id, list):
+            emo_ids = torch.tensor([emotion_id], device=device) # (1, L)
+        else:
+            emo_ids = torch.tensor([emotion_id], device=device) # (1,)
+
+        if isinstance(style_id, list):
+            sty_ids = torch.tensor([style_id], device=device) # (1, L)
+        else:
+            sty_ids = torch.tensor([style_id], device=device) # (1,)
+
+        conditioning, _, mel_len = self._encode(text_ids, emotion_ids=emo_ids, style_ids=sty_ids)
         shape = (text_ids.size(0), self.config.n_mel_channels, mel_len)
 
+        # We also need to pass the average/dominant emotion to the denoiser
+        # or update the denoiser to handle per-frame conditioning.
+        # Since conditioning is already per-frame (B, L_mel, D), the denoiser
+        # will naturally attend to the emotional context of that frame.
+        
         mel = self.diffusion.ddim_sample(
-            self.denoiser, conditioning, shape, device, temperature, eta
+            self.denoiser, conditioning, shape, device, steps=steps, temperature=temperature, eta=eta
         )
         return mel
 
@@ -541,7 +632,10 @@ class DiffTTSLoss(nn.Module):
 
         # Duration MSE in log space
         log_dur_gt = torch.log(durations_gt.float().clamp(min=1))
-        dur_loss   = F.mse_loss(log_dur_pred, log_dur_gt)
+        dur_loss   = F.mse_loss(log_dur_pred, log_dur_gt, reduction="none")
+        # Mask dur loss to only real tokens (gt > 0)
+        dur_mask   = (durations_gt > 0).float()
+        dur_loss   = (dur_loss * dur_mask).sum() / (dur_mask.sum() + 1e-8)
 
         total = noise_loss + self.dur_weight * dur_loss
         return total, noise_loss, dur_loss

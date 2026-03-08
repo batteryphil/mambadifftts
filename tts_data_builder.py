@@ -81,10 +81,13 @@ def text_to_ids(text: str) -> List[int]:
 def wav_to_mel(wav_path: str) -> np.ndarray:
     """
     Load a wav file and compute a log-mel spectrogram.
-
-    Returns shape: (n_mels, time_frames)
+    Uses soundfile for robust loading on Windows.
     """
-    y, _ = librosa.load(wav_path, sr=SAMPLE_RATE, mono=True)
+    import soundfile as sf
+    y, sr = sf.read(wav_path)
+    if sr != SAMPLE_RATE:
+        y = librosa.resample(y, orig_sr=sr, target_sr=SAMPLE_RATE)
+        
     mel = librosa.feature.melspectrogram(
         y=y,
         sr=SAMPLE_RATE,

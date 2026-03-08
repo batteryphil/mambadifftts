@@ -17,9 +17,9 @@ app = Flask(__name__)
 
 # ─── Model Initialization (Runs once at server startup) ───────────────────────
 print("Initializing JARVIS Web UI...")
-# Force CPU for inference so training gets the full GPU uncontested
-DEVICE = "cpu"
-print("  -> Inference locked to CPU (training owns GPU)")
+# Auto-select GPU if available
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"  -> Running on {DEVICE}")
 
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 tokenizer.add_special_tokens({"mask_token": "[MASK]"})

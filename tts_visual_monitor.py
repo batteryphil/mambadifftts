@@ -105,8 +105,13 @@ def animate(frame: int,
     stats        = _load_stats()
     train_loss   = stats.get("train_loss",  [])
     val_records  = stats.get("val_loss",    [])    # list of {"step":N,"loss":F}
+    vram_usage   = stats.get("vram_usage",  [])
     current_step = stats.get("step",        0)
     elapsed      = time.time() - _start_time
+
+    # Store the first global step we see to calculate session-relative speed
+    if not hasattr(animate, "initial_step"):
+        animate.initial_step = current_step
 
     # ------------------------------------------------------------------ #
     # Panel 1 — Full Loss Curve                                           #
@@ -158,8 +163,15 @@ def animate(frame: int,
     best_val = min((r["loss"] for r in val_records if isinstance(r, dict)),
                    default=float("nan"))
     cur_loss = train_loss[-1] if train_loss else float("nan")
-    # Rough samples/sec from step count and elapsed
-    sps = (current_step * 32) / max(elapsed, 1)   # 32 = effective batch
+    vram_cur = vram_usage[-1] if vram_usage else float("nan")
+    vram_peak = max(vram_usage) if vram_usage else float("nan")
+
+    # Correct samples/sec from delta step count and session elapsed
+    delta_steps = current_step - animate.initial_step
+    sps = (delta_steps * 128) / max(elapsed, 1)   # 128 = total samples per step (batch*accum)
+    if delta_steps == 0 and elapsed > 10:
+        # If we've been running for a while but no steps, show 0 instead of infinity/nonsense
+        sps = 0.0
 
     stats_lines = [
         ("MAMBA TTS MONITOR v1",  MAGENTA, 13),
@@ -173,6 +185,8 @@ def animate(frame: int,
         (f"BEST VAL      {best_val:.4f}" if not np.isnan(best_val)
                        else "BEST VAL      --",      MAGENTA, 11),
         ("─" * 26,                DIM,      9),
+        (f"VRAM CUR      {vram_cur:.2f} GB", CYAN,   11),
+        (f"VRAM PEAK     {vram_peak:.2f} GB", CYAN,   11),
         (f"SAMPLES/S     {sps:.1f}",         CYAN,   10),
         (f"ELAPSED       {_elapsed_str(elapsed)}", GREY, 10),
         ("─" * 26,                DIM,      9),
